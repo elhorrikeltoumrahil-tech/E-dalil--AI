@@ -1,31 +1,38 @@
 import os
 import json
-import re
 import tempfile
+import time
+import subprocess
+import sys
+from datetime import datetime, timedelta
+
 import chromadb
+import pdfplumber
+import arabic_reshaper
+from bidi.algorithm import get_display
 from chromadb.errors import NotFoundError
 from sentence_transformers import SentenceTransformer
-from google import genai
-from google.genai import types
-from flask import Flask, request, jsonify, send_from_directory
+import ollama
+from flask import Flask, request, jsonify, send_from_directory, send_file
 from flask_cors import CORS
-import fitz  # PyMuPDF
-from paddleocr import PaddleOCR
 from dotenv import load_dotenv
+import easyocr
+import fitz  # PyMuPDF
 
 app = Flask(__name__)
 CORS(app)
-
-# ========== إعدادات متغيرات البيئة ==========
-from dotenv import load_dotenv
 load_dotenv()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
-
-# ========== تحميل نموذج التضمين ==========
-print("⏳ جاري تحميل نموذج التضمين...")
+# ========== تحميل النماذج ==========
+print("⏳ جاري تحميل نموذج التضمين (Embedding)...")
 model_embedding = SentenceTransformer('intfloat/multilingual-e5-small')
+
+print("⏳ جاري تهيئة EasyOCR للغة العربية...")
+try:
+    easyocr_reader = easyocr.Reader(['ar', 'en'], gpu=False, verbose=False)
+except Exception as e:
+    print(f"⚠️ خطأ في تهيئة EasyOCR: {e}")
+    easyocr_reader = None
 
 # ========== الاتصال بقاعدة البيانات ==========
 client_db = chromadb.PersistentClient(path="legal_db")
@@ -48,237 +55,271 @@ def save_history(history):
     with open(HISTORY_FILE, "w", encoding="utf-8") as f:
         json.dump(list(history), f, ensure_ascii=False, indent=2)
 
-# ========== معالج المستندات الذكي (SmartDocumentProcessor) ==========
-class SmartDocumentProcessor:
-    def __init__(self, pdf_path):
-        self.pdf_path = pdf_path
-        self.full_text = ""
-        # تهيئة PaddleOCR للغة العربية
-        self.ocr = PaddleOCR(lang='ar')
+# ========== دوال تنظيف النص العربي ==========
+def clean_arabic_text(text):
+    if not text:
+        return ""
+    try:
+        reshaped = arabic_reshaper.reshape(text)
+        bidi_text = get_display(reshaped)
+        return bidi_text
+    except Exception as e:
+        print(f"⚠️ خطأ في تنظيف النص: {e}")
+        return text
 
-        # تعبير نمطي للبحث عن عناوين المواد والفصول والأقسام (يدعم الأرقام العربية والإنجليزية والرومانية)
-        self.heading_pattern = re.compile(
-            r'(المادة|الفصل|القسم|الفرع|الباب|المبحث)\s+(\d+|الأول|الثاني|الثالث|الرابع|الخامس|[IVXLCDM]+)',
-            re.IGNORECASE
-        )
+def has_substantial_text(text):
+    return text and len(text.strip()) > 50
 
-    def fix_arabic_rtl(self, text):
-        """
-        إصلاح النص العربي المقلوب (RTL) الذي قد يظهر معكوساً بسبب PaddleOCR.
-        تعمل هذه الدالة على عكس ترتيب الكلمات في السطر إذا كان النص يبدو معكوساً.
-        """
-        if not text:
-            return ""
-        lines = text.split('\n')
-        fixed_lines = []
-        for line in lines:
-            # إذا كان السطر يحتوي على عربية ويبدو مقلوباً (وجود كلمة "ةداملا" مثلاً)
-            if re.search(r'[\u0600-\u06FF]', line) and ("ةداملا" in line or "نوناق" in line):
-                fixed_line = line[::-1]  # عكس السطر بالكامل
-                fixed_lines.append(fixed_line)
-            else:
-                fixed_lines.append(line)
-        return "\n".join(fixed_lines)
+# ========== استخراج النص من PDF/صور ==========
+def extract_text_with_fallback(file_path, file_extension=None):
+    full_text = ""
+    method_used = None
 
-    def extract_text(self):
-        """استخراج النص من ملف PDF باستخدام PyMuPDF للنصوص العادية و PaddleOCR للصفحات الممسوحة"""
-        doc = fitz.open(self.pdf_path)
-        for page_num in range(len(doc)):
-            page = doc.load_page(page_num)
-            page_text = page.get_text()
-            if page_text.strip():
-                # إذا كانت الصفحة تحتوي على نص قابل للاستخراج مباشرة
-                self.full_text += page_text + "\n"
-            else:
-                # إذا كانت الصفحة فارغة (ممسوحة ضوئياً)، استخدم PaddleOCR
-                print(f"   📸 الصفحة {page_num+1} ممسوحة ضوئياً، جاري استخدام OCR...")
-                pix = page.get_pixmap()
-                img_path = f"temp_page_{page_num}.png"
-                pix.save(img_path)
-                try:
-                    result = self.ocr.ocr(img_path, cls=True)
-                    if result and result[0]:
-                        for line in result[0]:
-                            self.full_text += line[1][0] + " "
-                except Exception as e:
-                    print(f"   ⚠️ خطأ في OCR للصفحة {page_num+1}: {e}")
-                finally:
-                    if os.path.exists(img_path):
-                        os.remove(img_path)
-        # إصلاح اتجاه النص العربي (RTL)
-        self.full_text = self.fix_arabic_rtl(self.full_text)
-        return self.full_text
+    if file_extension == '.pdf' or (file_extension is None and file_path.lower().endswith('.pdf')):
+        try:
+            with pdfplumber.open(file_path) as pdf:
+                for page in pdf.pages:
+                    text = page.extract_text()
+                    if text:
+                        full_text += text + "\n"
+            if has_substantial_text(full_text):
+                method_used = "pdfplumber (نصوص رقمية)"
+                return full_text, method_used
+        except Exception as e:
+            print(f"⚠️ فشل pdfplumber: {e}")
 
-    def smart_chunk(self, text):
-        """تقطيع النص بناءً على العناوين (المواد، الفصول، إلخ) مع الاحتفاظ بالسياق"""
-        chunks = []
-        current_chunk = ""
-        lines = text.split('\n')
-        for line in lines:
-            # إذا وجدنا سطراً يبدو كعنوان قانوني، نبدأ قطعة جديدة
-            if self.heading_pattern.search(line):
-                if current_chunk:
-                    chunks.append(current_chunk.strip())
-                current_chunk = line + "\n"
-            else:
-                current_chunk += line + "\n"
-        if current_chunk:
-            chunks.append(current_chunk.strip())
-        # إذا لم يتم العثور على أي عنوان، قم بتقطيع النص إلى أجزاء بطول 500 كلمة كحل احتياطي
-        if len(chunks) <= 1 and len(text.split()) > 500:
-            words = text.split()
+        if easyocr_reader:
+            try:
+                doc = fitz.open(file_path)
+                ocr_text = ""
+                for page_num in range(len(doc)):
+                    pix = doc.load_page(page_num).get_pixmap(dpi=150)
+                    img_path = f"temp_page_{page_num}.png"
+                    pix.save(img_path)
+                    result = easyocr_reader.readtext(img_path, detail=0, paragraph=True)
+                    if result:
+                        ocr_text += " ".join(result) + "\n"
+                    os.remove(img_path)
+                doc.close()
+                if has_substantial_text(ocr_text):
+                    return ocr_text, "EasyOCR (PDF ممسوح)"
+            except Exception as e:
+                print(f"⚠️ فشل EasyOCR: {e}")
+
+    elif file_extension in ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']:
+        if easyocr_reader:
+            result = easyocr_reader.readtext(file_path, detail=0, paragraph=True)
+            if result:
+                return " ".join(result), "EasyOCR (صورة)"
+
+    return "", None
+
+def chunk_text(text, chunk_size=500):
+    words = text.split()
+    chunks = []
+    buffer = []
+    current_len = 0
+    for word in words:
+        buffer.append(word)
+        current_len += len(word) + 1
+        if current_len >= chunk_size:
+            chunks.append(" ".join(buffer))
             buffer = []
             current_len = 0
-            for word in words:
-                buffer.append(word)
-                current_len += len(word) + 1
-                if current_len >= 500:
-                    chunks.append(" ".join(buffer))
-                    buffer = []
-                    current_len = 0
-            if buffer:
-                chunks.append(" ".join(buffer))
-        return chunks
+    if buffer:
+        chunks.append(" ".join(buffer))
+    return chunks
 
-    def process(self):
-        """تنفيذ العملية الكاملة: استخراج + تقطيع"""
-        print(f"   📄 معالجة الملف: {os.path.basename(self.pdf_path)}")
-        full_text = self.extract_text()
-        if not full_text.strip():
-            return []
-        chunks = self.smart_chunk(full_text)
-        print(f"   ✅ تم استخراج {len(chunks)} قطعة نصية.")
-        return chunks
-
-# ========== دالة إضافة ملف PDF إلى المكتبة (معدلة) ==========
-def add_pdf_to_library(pdf_path):
-    rel_path = os.path.basename(pdf_path)
+def add_file_to_library(file_path, original_filename=None):
+    display_name = original_filename or os.path.basename(file_path)
     history = load_history()
-    if rel_path in history:
-        return f"⚠️ الملف '{rel_path}' تمت إضافته مسبقاً."
+    if display_name in history:
+        return f"⚠️ الملف '{display_name}' تمت إضافته مسبقاً."
 
-    try:
-        # استخدام المعالج الذكي
-        processor = SmartDocumentProcessor(pdf_path)
-        chunks = processor.process()
-        if not chunks:
-            return "❌ لم يتم استخراج أي نصوص من الملف."
+    full_text, method = extract_text_with_fallback(file_path, os.path.splitext(file_path)[1].lower())
+    if not full_text:
+        return "❌ تعذر استخراج النص."
 
-        # حساب المتجهات والإضافة إلى قاعدة البيانات
-        embeddings = []
-        ids = []
-        metadatas = []
-        for idx, chunk in enumerate(chunks):
-            vector = model_embedding.encode("passage: " + chunk).tolist()
-            embeddings.append(vector)
-            ids.append(f"{rel_path}_part{idx+1}")
-            metadatas.append({"source": rel_path})
+    clean_text = clean_arabic_text(full_text)
+    chunks = chunk_text(clean_text)
 
-        collection.add(
-            documents=chunks,
-            embeddings=embeddings,
-            metadatas=metadatas,
-            ids=ids
-        )
+    embeddings = [model_embedding.encode("passage: " + c).tolist() for c in chunks]
+    ids = [f"{display_name}_{idx}" for idx in range(len(chunks))]
+    metadatas = [{"source": display_name} for _ in chunks]
 
-        history.add(rel_path)
-        save_history(history)
-        return f"✅ تمت إضافة {len(chunks)} جزء من الملف '{rel_path}' بنجاح."
-    except Exception as e:
-        return f"❌ خطأ: {str(e)}"
+    collection.add(documents=chunks, embeddings=embeddings, metadatas=metadatas, ids=ids)
+    history.add(display_name)
+    save_history(history)
+    return f"✅ تمت إضافة '{display_name}' بنجاح عبر {method}."
 
-# ========== دالة المسح الأولي (إذا كانت قاعدة البيانات فارغة) ==========
 def initial_scan_and_build():
     if collection.count() > 0:
-        print("✅ قاعدة البيانات تحتوي بالفعل على بيانات. تخطي المسح الأولي.")
         return
-
-    print("📂 قاعدة البيانات فارغة. بدء المسح الأولي للمجلدات...")
-    # تحديد مجلدات PDF الموجودة (يمكنك تعديل المسارات حسب هيكلك)
-    pdf_folders = [
-        "data/قوانين السجل التجاري",
-        "data/التجارة الالكترونية",
-        "data/01--- قوانين وزارة التجارة"
-    ]
-    all_pdfs = []
-    for folder in pdf_folders:
+    folders = ["data/01--- قوانين وزارة التجارة", "data/التجارة الالكترونية", "data/قوانين السجل التجاري", "data/contrats_exemples", "data/كتب تجارية"]
+    for folder in folders:
         if os.path.exists(folder):
             for root, _, files in os.walk(folder):
                 for file in files:
-                    if file.lower().endswith(".pdf"):
-                        all_pdfs.append(os.path.join(root, file))
+                    if file.lower().endswith('.pdf'):
+                        print(add_file_to_library(os.path.join(root, file)))
 
-    if not all_pdfs:
-        print("⚠️ لم يتم العثور على أي ملفات PDF في المجلدات المحددة.")
-        return
-
-    print(f"📄 تم العثور على {len(all_pdfs)} ملف PDF. جاري المعالجة...")
-    for pdf_path in all_pdfs:
-        print(f"   معالجة: {pdf_path}")
-        result = add_pdf_to_library(pdf_path)
-        print(f"   {result}")
-    print("🎉 انتهى المسح الأولي بنجاح.")
-
-    for folder in pdf_folders:
-        print(f"🔍 جاري فحص المجلد: {folder}")
-        if os.path.exists(folder):
-            print(f"   ✅ المجلد موجود")
-        else:
-            print(f"   ❌ المجلد غير موجود")
-# ========== دوال البحث والإجابة (نفس السابق) ==========
+# ========== دالة الإجابة باستخدام Ollama ==========
 def ask_lawyer(query):
-    if not client:
-        return {"answer": "❌ مفتاح Gemini API غير مضبوط. يرجى تعيين GEMINI_API_KEY.", "sources": []}
-
-    query_vector = model_embedding.encode("query: " + query).tolist()
     try:
-        results = collection.query(query_embeddings=[query_vector], n_results=5)
+        query_embedding = model_embedding.encode([query]).tolist()
+        results = collection.query(query_embeddings=query_embedding, n_results=3)
+
+        context = "\n".join(results['documents'][0]) if results['documents'] else "لا يوجد سياق قانوني متاح."
+
+        full_prompt = f"""أنت مستشار قانوني جزائري محترف.
+مهمتك: تقديم إجابات قانونية دقيقة ومنظمة بناءً فقط على النصوص القانونية المرفقة.
+
+قواعد التنسيق الإلزامية:
+- استخدم عناوين رئيسية على شكل: 1-العنوان (استخدم الأرقام)
+- استخدم عناوين فرعية على شكل: أ-العنوان(استخدم الحرف)
+- افصل بين كل عنوان و عنوان بسطر فارغ.
+- استعمل خط كبير للعنوانين و خط رقيق للاجابة 
+- لا تنسخ النص حرفياً من المصادر، بل أعد صياغته بلغة قانونية واضحة ومختصرة.
+- لا تذكر عبارات مثل "بناءً على النصوص أعلاه" أو "وفقاً للمصادر". ابدأ الإجابة مباشرة.
+
+النصوص القانونية:
+{context}
+
+سؤال المستخدم:
+{query}
+
+الإجابة (باللغة العربية):"""
+        response = ollama.chat(model='kimi-k2.5:cloud', messages=[{'role': 'user', 'content': full_prompt}])
+        return {"answer": response['message']['content']}
     except Exception as e:
-        return {"answer": f"⚠️ خطأ في البحث: {e}", "sources": []}
+        print(f"❌ خطأ في Ollama: {e}")
+        return {"answer": "حدث خطأ أثناء محاولة معالجة السؤال محلياً. تأكد من تشغيل برنامج Ollama."}
 
-    if not results['documents'][0]:
-        return {"answer": "عذراً، لم أتمكن من العثور على معلومات متعلقة بسؤالك.", "sources": []}
+# ========== مولد العقود ==========
+def generate_contract(contract_type, parties, subject, duration, amount):
+    prompt = f"""أنت مستشار قانوني جزائري متخصص في صياغة العقود.
+بناءً على النصوص القانونية الجزائرية (قانون التجارة، قانون الصفقات العمومية، القانون المدني)، قم بإنشاء عقد كامل من نوع "{contract_type}" يتضمن المواد التالية على الأقل:
+- تعريف الأطراف
+- موضوع العقد
+- المدة: {duration}
+- المبلغ: {amount}
+- التزامات الطرفين
+- شروط الدفع
+- الجزاءات والغرامات التأخيرية
+- الضمانات
+- تسوية النزاعات (التحكيم أو المحاكم الجزائرية)
+- أحكام عامة (القوة القاهرة، اللغة، عدد النسخ)
 
-    context = "\n\n".join(results['documents'][0])
+أطراف العقد:
+{parties}
 
-    system_prompt = """أنت مستشار قانوني جزائري خبير.
-    مهمتك هي الإجابة على أسئلة المستخدمين بناءً على النصوص القانونية المقدمة فقط.
+موضوع العقد:
+{subject}
 
-    تعليمات مهمة:
-    - قدم إجابة شاملة وكاملة دون اختصار.
-    - اذكر المصدر باختصار (مثل: "المادة 5 من القانون التجاري").
-    - استخدم اللغة العربية الفصحى الواضحة.
-    - إذا لم تجد المعلومة في النصوص، أخبر المستخدم بذلك بوضوح."""
+اكتب العقد بلغة قانونية واضحة، مرقماً المواد (مادة 1، مادة 2...)، منسقاً بأسطر فارغة بين المواد. لا تذكر أي جمل تمهيدية مثل "بناءً على طلبك". ابدأ مباشرة بنص العقد.
+"""
+    response = ollama.chat(model='kimi-k2.5:cloud', messages=[{'role': 'user', 'content': prompt}])
+    return response['message']['content']
 
-    user_prompt = f"النصوص القانونية المتوفرة:\n{context}\n\nالسؤال: {query}"
-    full_prompt = f"{system_prompt}\n\n{user_prompt}"
+@app.route('/generate_contract', methods=['POST'])
+def api_generate_contract():
+    data = request.get_json()
+    contract_type = data.get('type')
+    parties = data.get('parties')
+    subject = data.get('subject')
+    duration = data.get('duration')
+    amount = data.get('amount')
+    if not all([contract_type, parties, subject]):
+        return jsonify({"error": "يرجى ملء الحقول المطلوبة"}), 400
+    contract_text = generate_contract(contract_type, parties, subject, duration, amount)
+    return jsonify({"contract": contract_text})
 
+@app.route('/download_contract_pdf', methods=['POST'])
+def download_contract_pdf():
+    data = request.get_json()
+    contract_text = data.get('contract')
+    if not contract_text:
+        return jsonify({"error": "لا يوجد نص عقد"}), 400
     try:
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=full_prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.3,
-                max_output_tokens=4096,
-                top_p=0.9
-            )
-        )
-        sources = []
-        for i, doc in enumerate(results['documents'][0]):
-            src = results['metadatas'][0][i]['source']
-            sources.append({"source": src, "text_preview": doc[:300] + "..."})
-        return {"answer": response.text, "sources": sources}
-    except Exception as e:
-        return {"answer": f"⚠️ خطأ في الاتصال: {str(e)}", "sources": []}
+        from fpdf import FPDF
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "fpdf2"])
+        from fpdf import FPDF
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font('Helvetica', size=12)
+    for line in contract_text.split('\n'):
+        pdf.multi_cell(0, 10, line)
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
+    pdf.output(temp_file.name)
+    return send_file(temp_file.name, as_attachment=True, download_name='contrat_genere.pdf')
+
+# ========== محلل المستندات ==========
+@app.route('/analyze_document', methods=['POST'])
+def analyze_document():
+    if 'file' not in request.files:
+        return jsonify({"error": "لا يوجد ملف"}), 400
+    file = request.files['file']
+    ext = os.path.splitext(file.filename)[1].lower()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+        file.save(tmp.name)
+        text, method = extract_text_with_fallback(tmp.name, ext)
+    os.unlink(tmp.name)
+    if not text:
+        return jsonify({"error": "تعذر استخراج النص من الملف"}), 400
+    prompt = f"""أنت خبير قانوني جزائري. قم بتحليل النص التالي وأخرج:
+1. ملخص (3-5 جمل)
+2. نقاط الخطر القانونية (Clauses à risque) - إن وجدت، وإلا اذكر "لا توجد نقاط خطر واضحة"
+3. توصيات عملية للمستخدم
+
+النص:
+{text[:4000]}
+
+أجب بالتنسيق التالي:
+**الملخص:**
+...
+**نقاط الخطر:**
+- ...
+**التوصيات:**
+- ...
+"""
+    response = ollama.chat(model='kimi-k2.5:cloud', messages=[{'role': 'user', 'content': prompt}])
+    return jsonify({"analysis": response['message']['content']})
+
+# ========== حاسبة المواعيد القانونية ==========
+LEGAL_DEADLINES = {
+    "تقادم دعوى مدنية": 15,
+    "تقادم دعوى تجارية": 10,
+    "الطعن في صفقة عمومية (بعد التبليغ)": 60,
+    "الطعن في قرار إداري": 30,
+    "إنهاء عقد عمل (إشعار مسبق)": 30,
+}
+
+@app.route('/calculate_deadlines', methods=['POST'])
+def calculate_deadlines():
+    data = request.get_json()
+    action = data.get('action')
+    start_date_str = data.get('start_date')
+    if not action or not start_date_str:
+        return jsonify({"error": "يرجى تحديد الإجراء والتاريخ"}), 400
+    if action not in LEGAL_DEADLINES:
+        return jsonify({"error": "نوع الإجراء غير معروف"}), 400
+    start_date = datetime.strptime(start_date_str, '%Y-%m-%d')
+    days = LEGAL_DEADLINES[action]
+    delta = timedelta(days=days)
+    end_date = start_date + delta
+    return jsonify({
+        "action": action,
+        "start_date": start_date_str,
+        "deadline_date": end_date.strftime('%Y-%m-%d'),
+        "days_remaining": max(0, (end_date - datetime.now()).days),
+        "legal_basis": "المادة المرجعية حسب القانون الجزائري"
+    })
 
 # ========== مسارات API ==========
 @app.route('/')
 def serve_index():
     return send_from_directory('.', 'index.html')
-
-@app.route('/<path:path>')
-def serve_static(path):
-    return send_from_directory('.', path)
 
 @app.route('/ask', methods=['POST'])
 def ask():
@@ -286,31 +327,26 @@ def ask():
     query = data.get('query', '')
     if not query:
         return jsonify({"error": "الرجاء إدخال سؤال"}), 400
-    result = ask_lawyer(query)
-    return jsonify(result)
+    return jsonify(ask_lawyer(query))
 
 @app.route('/upload', methods=['POST'])
 def upload():
     if 'file' not in request.files:
-        return jsonify({"error": "لم يتم رفع أي ملف"}), 400
+        return jsonify({"error": "لا يوجد ملف"}), 400
     file = request.files['file']
-    if file.filename == '':
-        return jsonify({"error": "اسم الملف فارغ"}), 400
-    if not file.filename.lower().endswith('.pdf'):
-        return jsonify({"error": "الرجاء رفع ملف PDF فقط"}), 400
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
+    file_extension = os.path.splitext(file.filename)[1].lower()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as tmp:
         file.save(tmp.name)
-        result = add_pdf_to_library(tmp.name)
+        result = add_file_to_library(tmp.name, file.filename)
     os.unlink(tmp.name)
     return jsonify({"message": result})
 
 @app.route('/stats', methods=['GET'])
 def stats():
-    count = collection.count()
-    return jsonify({"chunks_count": count})
+    return jsonify({"chunks_count": collection.count()})
 
-# ========== تشغيل الخادم ==========
 if __name__ == '__main__':
+    # تأكد من وجود مجلد data/contrats_exemples وضع فيه ملف Contrat.pdf
+    os.makedirs("data/contrats_exemples", exist_ok=True)
     initial_scan_and_build()
     app.run(host='0.0.0.0', port=5000, debug=False)
