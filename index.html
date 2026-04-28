@@ -448,10 +448,10 @@
         .dash-input-box input { flex: 1; border: none; outline: none; font-size: 1rem; background: transparent; }
         .dash-input-box button { background: transparent; border: none; cursor: pointer; font-size: 1.2rem; color: #aaa; transition: 0.2s; padding: 5px; }
         .dash-input-box button:hover { color: var(--accent-gold); }
-        .input-actions { display: flex; gap: 8px; padding: 0 20px 12px 20px; border-top: 1px solid #f0f0f0; }
+        .input-actions { display: flex; gap: 8px; padding: 0 20px 12px 20px; border-top: 1px solid #f0f0f0; flex-wrap: wrap; justify-content: center; }
         .attach-btn { background: transparent; border: none; padding: 8px 12px; border-radius: 30px; cursor: pointer; font-size: 0.8rem; font-weight: 500; color: #666; transition: 0.2s; display: inline-flex; align-items: center; gap: 6px; }
         .attach-btn:hover { background: #f5f5f5; color: var(--accent-gold); }
-        #fileInput, #imageInput { display: none; }
+        #fileInput, #imageInput, #analyzeFileInput { display: none; }
 
         /* Pro Upgrade Section */
         .pro-upgrade-prompt {
@@ -492,7 +492,7 @@
         }
         .pro-plan-btn.premium {
             background: linear-gradient(95deg, #d4af37, #f3c94b);
-            color: #1f1a0a;
+            color: #1f1a0c;
             border: none;
             box-shadow: 0 6px 14px rgba(212,175,55,0.35);
         }
@@ -599,7 +599,6 @@
         <section class="services" id="services"><h2 data-key="services-title">Our AI-Powered Services</h2><div class="services-sub" data-key="services-sub">Instant, accurate, confidential — legal intelligence at your fingertips</div><div class="services-grid"><div class="s-card"><i class="fas fa-file-contract"></i><h3 data-key="card1-title">Contract Auditing</h3><p data-key="card1-desc">Upload any commercial contract for instant AI analysis, risk detection, and compliance checks.</p></div><div class="s-card"><i class="fas fa-landmark"></i><h3 data-key="card2-title">Commercial Code</h3><p data-key="card2-desc">Instant answers from the latest Algerian Commercial Laws and executive regulations.</p></div><div class="s-card"><i class="fas fa-building"></i><h3 data-key="card3-title">Company Setup</h3><p data-key="card3-desc">Step-by-step AI guidance for SARL/EURL formations and legal registrations.</p></div></div></section>
         <section class="about-section" id="about"><div class="about-grid"><div class="about-text"><h2 data-key="about-title">AI-driven legal precision for Algerian businesses</h2><p data-key="about-desc">E-dalil DZ combines cutting-edge language models with deep expertise in Algerian commercial law. Our platform is trusted by corporate counsels, startups, and legal practitioners across the country. We reduce turnaround time by 70% while maintaining absolute confidentiality and regulatory compliance.</p><div class="about-stats"><div class="stat">98%<span data-key="stat1">Accuracy rate</span></div><div class="stat">24/7<span data-key="stat2">AI assistant</span></div><div class="stat">+500<span data-key="stat3">Enterprise clients</span></div></div></div><div class="about-image"><i class="fas fa-shield-alt"></i><h3 data-key="secure-title">Secure & Compliant</h3><p data-key="secure-desc">GDPR & Algerian data protection certified — your data never leaves the jurisdiction.</p></div></div></section>
 
-        <!-- Updated Customers Section - General Categories -->
         <section class="customers-section" id="customers">
             <h2 data-key="customers-title">Trusted by professionals across Algeria</h2>
             <div class="logo-grid">
@@ -666,9 +665,10 @@
                             <div class="input-actions">
                                 <button class="attach-btn" onclick="document.getElementById('fileInput').click()"><i class="fas fa-paperclip"></i> <span data-key="attach-file">Attach File</span></button>
                                 <button class="attach-btn" onclick="document.getElementById('imageInput').click()"><i class="fas fa-image"></i> <span data-key="attach-image">Attach Image</span></button>
+                                <button class="attach-btn" onclick="showContractDialog()"><i class="fas fa-file-signature"></i> <span data-key="generate-contract">Generate Contract</span></button>
+                                <button class="attach-btn" onclick="document.getElementById('analyzeFileInput').click()"><i class="fas fa-search"></i> <span data-key="analyze-doc">Analyze Document</span></button>
                             </div>
                         </div>
-                        <!-- PRO UPGRADE SECTION -->
                         <div id="proUpgradeBlock" class="pro-upgrade-prompt">
                             <div class="pro-badge-icon"><i class="fas fa-gem"></i></div>
                             <h3>🚀 Unlock Pro Intelligence</h3>
@@ -690,14 +690,16 @@
         </div>
     </div>
 
-    <!-- Payment Modal -->
     <div id="paymentModal" class="payment-modal"><div class="payment-card"><span class="close-pay" onclick="closePaymentModal()" style="float:right; font-size:28px; cursor:pointer;">&times;</span><h2>✨ Upgrade to E-dalil Pro</h2><p style="margin:8px 0">Unlimited contract analysis, image legal OCR & deep accurate answers.</p><div id="planDisplay" style="margin: 8px 0;"></div><div class="payment-amount" id="payAmount">$0</div><input type="text" id="cardNumber" class="payment-input" placeholder="Card number ·· ·· ·· ··"><input type="text" id="cardExpiry" class="payment-input" placeholder="MM/YY"><input type="text" id="cardCVC" class="payment-input" placeholder="CVC"><button class="pay-confirm" id="confirmPayBtn">Confirm Subscription</button><p style="font-size:0.7rem; margin-top:16px;">🔒 Secure payment simulation • 30-day money back guarantee</p></div></div>
 
     <input type="file" id="fileInput" style="display:none" accept=".pdf,.docx,.txt" onchange="handleFileUpload(this)">
     <input type="file" id="imageInput" style="display:none" accept="image/*" onchange="handleImageUpload(this)">
+    <input type="file" id="analyzeFileInput" style="display:none" accept=".pdf,.jpg,.jpeg,.png" onchange="analyzeDocument(this)">
 
     <script>
-        // ======================== PRO SUBSCRIPTION ========================
+        // -------------------- CONFIGURATION --------------------
+        const API_BASE_URL = "http://localhost:5000";
+        let currentChatId = null;
         let isPro = false;
         let currentPlan = null;
         let pendingPlan = null;
@@ -814,33 +816,139 @@
 
         function triggerProUpgrade() { if(isPro) alert(currentLang === 'en' ? 'You already have Pro benefits!' : 'لديك بالفعل مميزات Pro!'); else initiateProSubscription('monthly'); }
 
-        // Enhanced sendMessage with PRO logic
-        function sendMessage() {
+        // -------------------- API INTEGRATION --------------------
+        async function sendMessage() {
             const input = document.getElementById('chatInput');
             const msg = input.value.trim();
-            if (!msg) { alert(currentLang === 'en' ? 'Please enter a question' : 'الرجاء إدخال سؤال'); return; }
-
-            let aiResponse = "";
-            if(isPro) {
-                if(msg.toLowerCase().includes('contract') || msg.toLowerCase().includes('عقد')) {
-                    aiResponse = "🔍 PRO ANALYSIS: Contract risk detected: Clause 4.2 non-compliant with Algerian Commercial Code (Art 122). Liability cap recommended. Full redline available. [Pro deep audit]";
-                } else if(msg.toLowerCase().includes('image') || msg.toLowerCase().includes('صورة')) {
-                    aiResponse = "📸 PRO OCR + LEGAL EXTRACTION: Image analyzed — detected legal stamps and handwritten clauses. Extracted text: 'Termination after 30 days notice...' Full transcription complete. (Pro feature)";
-                } else {
-                    aiResponse = `⚖️ E-dalil Pro (Algerian Legal AI): ${msg} → Based on Algerian Commercial Code, executive decree 21-148, the answer is: precise references and jurisprudence. Would you like the exact article? (Premium accuracy)`;
-                }
-            } else {
-                aiResponse = `🤖 Demo AI Response: Thank you for your question: "${msg}". For precise contract auditing, image legal analysis, and advanced accuracy, upgrade to E-dalil PRO (monthly/yearly). Pro includes deep Algerian commercial law insights.`;
+            if (!msg) {
+                alert(currentLang === 'en' ? 'Please enter a question' : 'الرجاء إدخال سؤال');
+                return;
             }
-            addNewChatToHistory(msg, aiResponse);
-            alert(aiResponse);
+            const sendBtn = document.querySelector('.dash-input-box button');
+            sendBtn.disabled = true;
+            sendBtn.innerHTML = '<i class="fas fa-spinner fa-pulse"></i>';
+            try {
+                const response = await fetch(`${API_BASE_URL}/ask`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ query: msg })
+                });
+                const data = await response.json();
+                const aiResponse = data.answer || "عذراً، لم أستطع معالجة طلبك.";
+                addNewChatToHistory(msg, aiResponse);
+                alert(aiResponse);
+            } catch (error) {
+                console.error('Error:', error);
+                alert(currentLang === 'en' ? 'Connection error. Is the backend running?' : 'خطأ في الاتصال. هل الخادم قيد التشغيل؟');
+            } finally {
+                sendBtn.disabled = false;
+                sendBtn.innerHTML = '<i class="fas fa-paper-plane"></i>';
+                input.value = '';
+            }
+        }
+
+        async function handleFileUpload(input) {
+            if (!input.files.length) return;
+            const file = input.files[0];
+            const formData = new FormData();
+            formData.append('file', file);
+            try {
+                alert(currentLang === 'en' ? 'Uploading file...' : 'جاري رفع الملف...');
+                const response = await fetch(`${API_BASE_URL}/upload`, {
+                    method: 'POST',
+                    body: formData
+                });
+                const result = await response.json();
+                alert(result.message || (currentLang === 'en' ? 'File uploaded successfully' : 'تم رفع الملف بنجاح'));
+            } catch (error) {
+                console.error('Upload error:', error);
+                alert(currentLang === 'en' ? 'Upload failed' : 'فشل الرفع');
+            }
+        }
+
+        async function handleImageUpload(input) {
+            if (!input.files.length) return;
+            const file = input.files[0];
+            const formData = new FormData();
+            formData.append('file', file);
+            try {
+                alert(currentLang === 'en' ? 'Analyzing document...' : 'جاري تحليل المستند...');
+                const response = await fetch(`${API_BASE_URL}/analyze_document`, {
+                    method: 'POST',
+                    body: formData
+                });
+                const data = await response.json();
+                if (data.analysis) {
+                    alert(data.analysis);
+                    addNewChatToHistory(`[Document Analysis] ${file.name}`, data.analysis);
+                } else {
+                    alert(currentLang === 'en' ? 'Analysis failed' : 'فشل التحليل');
+                }
+            } catch (error) {
+                console.error('Analysis error:', error);
+                alert(currentLang === 'en' ? 'Analysis error' : 'خطأ في التحليل');
+            }
+        }
+
+        // Contract generation
+        async function generateContract(contractData) {
+            try {
+                const response = await fetch(`${API_BASE_URL}/generate_contract`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(contractData)
+                });
+                const data = await response.json();
+                if (data.contract) {
+                    alert(data.contract);
+                    addNewChatToHistory(`عقد: ${contractData.type}`, data.contract);
+                } else {
+                    alert('فشل في توليد العقد');
+                }
+            } catch (error) {
+                console.error(error);
+                alert('خطأ في الاتصال بالخادم لتوليد العقد');
+            }
+        }
+
+        function showContractDialog() {
+            let type = prompt("نوع العقد (مثال: بيع، شراكة، عمل، مقاولة):");
+            if (!type) return;
+            let parties = prompt("الأطراف (مثال: شركة الأمل للتجارة و شركة النور للمقاولات):");
+            if (!parties) return;
+            let subject = prompt("موضوع العقد (وصف مختصر):");
+            if (!subject) return;
+            let duration = prompt("المدة (اختياري، اتركه فارغاً إن لم يكن محدداً):");
+            let amount = prompt("المبلغ (اختياري، اتركه فارغاً):");
+            generateContract({ type, parties, subject, duration, amount });
+        }
+
+        async function analyzeDocument(input) {
+            if (!input.files.length) return;
+            const file = input.files[0];
+            const formData = new FormData();
+            formData.append('file', file);
+            try {
+                alert('⏳ جاري تحليل المستند...');
+                const response = await fetch(`${API_BASE_URL}/analyze_document`, {
+                    method: 'POST',
+                    body: formData
+                });
+                const data = await response.json();
+                if (data.analysis) {
+                    alert(data.analysis);
+                    addNewChatToHistory(`📄 تحليل مستند: ${file.name}`, data.analysis);
+                } else {
+                    alert('❌ فشل التحليل');
+                }
+            } catch (error) {
+                console.error('Analysis error:', error);
+                alert('⚠️ خطأ في الاتصال بالخادم لتحليل المستند');
+            }
             input.value = '';
         }
 
-        function handleFileUpload(input) { if(input.files.length) alert(isPro ? `📄 Pro contract analysis: ${input.files[0].name} will be deep-scanned.` : `📎 ${input.files[0].name} uploaded. Upgrade to Pro for full contract auditing.`); }
-        function handleImageUpload(input) { if(input.files.length) alert(isPro ? `🖼️ Pro image legal OCR: ${input.files[0].name} text extraction active.` : `🖼️ Image uploaded. Pro feature unlocks OCR and legal interpretation.`); }
-
-        // Auth handlers - IMPORTANT: No auto-login, only manual signup shows dashboard
+        // Auth handlers
         function showAuth() { document.getElementById('authModal').style.display = 'flex'; }
         function hideAuth() { document.getElementById('authModal').style.display = 'none'; }
         function handleSignUp() {
@@ -866,7 +974,6 @@
             document.getElementById('main-site').style.display = 'block';
             document.getElementById('dashboard-view').style.display = 'none';
         }
-        // IMPORTANT: Removed auto-checkAuth on load - now only manual login shows dashboard
         function newChat() { currentChatId = null; document.getElementById('chatInput').value = ''; alert(currentLang === 'en' ? '✨ New conversation started. Type your legal question below!' : '✨ بدأت محادثة جديدة. اكتب سؤالك القانوني أدناه!'); }
 
         // Translations
@@ -897,8 +1004,8 @@
                 "modal-welcome-title":"Welcome <br>to E-dalil DZ","modal-welcome-desc":"Sign in to access your AI legal dashboard.","modal-signup-title":"Sign Up","modal-signup-btn":"Create Account","google-text":"Continue with Google","apple-text":"Continue with Apple","modal-terms":"By signing up you agree to our Terms & Privacy",
                 "signup-name":"Full Name","signup-email":"Email","signup-password":"Password",
                 "dash-title":"Which legal task can AI accelerate for you today?","dash-input-placeholder":"What task would you like to do next?",
-                "attach-file":"Attach File","attach-image":"Attach Image","contract-template":"Pro Upgrade","dash-logout":"Logout",
-                "history-label":"HISTORY","new-chat":"+ New Chat"
+                "attach-file":"Attach File","attach-image":"Attach Image","generate-contract":"Generate Contract","analyze-doc":"Analyze Document",
+                "contract-template":"Pro Upgrade","dash-logout":"Logout","history-label":"HISTORY","new-chat":"+ New Chat"
             },
             ar: {
                 "nav-home":"الرئيسية","nav-services":"الخدمات","nav-about":"من نحن","nav-customers":"العملاء","nav-contact":"اتصل بنا",
@@ -926,8 +1033,8 @@
                 "modal-welcome-title":"مرحباً <br>في E-dalil DZ","modal-welcome-desc":"سجل الدخول للوصول إلى لوحة التحكم القانونية بالذكاء الاصطناعي.","modal-signup-title":"إنشاء حساب","modal-signup-btn":"إنشاء حساب","google-text":"المتابعة بواسطة Google","apple-text":"المتابعة بواسطة Apple","modal-terms":"بالتسجيل فإنك توافق على الشروط والخصوصية",
                 "signup-name":"الاسم الكامل","signup-email":"البريد الإلكتروني","signup-password":"كلمة المرور",
                 "dash-title":"أي مهمة قانونية يمكن للذكاء الاصطناعي تسريعها لك اليوم؟","dash-input-placeholder":"ما المهمة التالية التي تريد تنفيذها؟",
-                "attach-file":"رفع ملف","attach-image":"رفع صورة","contract-template":"الترقية إلى Pro","dash-logout":"تسجيل الخروج",
-                "history-label":"السجل","new-chat":"+ محادثة جديدة"
+                "attach-file":"رفع ملف","attach-image":"رفع صورة","generate-contract":"إنشاء عقد","analyze-doc":"تحليل مستند",
+                "contract-template":"الترقية إلى Pro","dash-logout":"تسجيل الخروج","history-label":"السجل","new-chat":"+ محادثة جديدة"
             }
         };
         let currentLang = 'en';
@@ -957,13 +1064,12 @@
         }
         function toggleLanguage() { const newLang = currentLang === 'en' ? 'ar' : 'en'; applyLanguage(newLang); }
 
-        // Observer & Init - NO AUTO LOGIN CHECK
+        // Observer & Init
         const revealSections = document.querySelectorAll('.services, .about-section, .customers-section, .premium-footer');
         const observer = new IntersectionObserver((entries) => { entries.forEach(entry => { if (entry.isIntersecting) entry.target.classList.add('reveal'); }); }, { threshold: 0.15, once: true });
         revealSections.forEach(section => observer.observe(section));
         window.addEventListener('load', () => {
             revealSections.forEach(section => { const rect = section.getBoundingClientRect(); if (rect.top < window.innerHeight - 100) section.classList.add('reveal'); });
-            // NO auto-checkAuth - site starts with main page visible
             applyLanguage('en');
             renderHistorySidebar();
         });
