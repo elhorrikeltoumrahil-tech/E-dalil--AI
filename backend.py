@@ -1,7 +1,6 @@
 import os
 import json
 import tempfile
-import time
 import subprocess
 import sys
 from datetime import datetime, timedelta
@@ -12,16 +11,23 @@ import arabic_reshaper
 from bidi.algorithm import get_display
 from chromadb.errors import NotFoundError
 from sentence_transformers import SentenceTransformer
-import ollama
 from flask import Flask, request, jsonify, send_from_directory, send_file
 from flask_cors import CORS
 from dotenv import load_dotenv
 import easyocr
 import fitz  # PyMuPDF
+import google.generativeai as genai
 
 app = Flask(__name__)
 CORS(app)
 load_dotenv()
+
+# ========== تهيئة Gemini API ==========
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+else:
+    print("⚠️ تحذير: GEMINI_API_KEY غير موجود في ملف .env")
 
 # ========== تحميل النماذج ==========
 print("⏳ جاري تحميل نموذج التضمين (Embedding)...")
@@ -173,7 +179,7 @@ def initial_scan_and_build():
                         print(add_file_to_library(os.path.join(root, file)))
 
 
-# ========== دالة الإجابة باستخدام Ollama ==========
+# ========== دالة الإجابة باستخدام Gemini 1.5 Flash ==========
 def ask_lawyer(query):
     try:
         query_embedding = model_embedding.encode([query]).tolist()
@@ -200,11 +206,12 @@ def ask_lawyer(query):
 
 الإجابة (باللغة العربية):"""
 
-        response = ollama.chat(model='glm-5:cloud', messages=[{'role': 'user', 'content': full_prompt}])
-        return {"answer": response['message']['content']}
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        response = model.generate_content(full_prompt)
+        return {"answer": response.text}
     except Exception as e:
-        print(f"❌ خطأ في Ollama: {e}")
-        return {"answer": "حدث خطأ أثناء محاولة معالجة السؤال محلياً. تأكد من تشغيل برنامج Ollama."}
+        print(f"❌ خطأ في طلب Gemini API: {e}")
+        return {"answer": "حدث خطأ أثناء معالجة السؤال. يرجى التحقق من مفتاح API Key."}
 
 
 # ========== مولد العقود ==========
@@ -228,10 +235,11 @@ def generate_contract(contract_type, parties, subject, duration, amount):
 موضوع العقد:
 {subject}
 
-اكتب العقد بلغة قانونية واضحة، مرقماً المواد (مادة 1، مادة 2...)، منسقاً بأسطر فارغة بين المواد. لا تذكر أي جمل تمهيدية مثل "بناءً على طلبك". ابدأ مباشرة بنص العقد.
+اكتب العقد بلغة قانونية واضحة، مرقماً المواد (مادة 1، مادة 2...), منسقاً بأسطر فارغة بين المواد. لا تذكر أي جمل تمهيدية مثل "بناءً على طلبك". ابدأ مباشرة بنص العقد.
 """
-    response = ollama.chat(model='kimi-k2.5:cloud', messages=[{'role': 'user', 'content': prompt}])
-    return response['message']['content']
+    model = genai.GenerativeModel('gemini-1.5-flash')
+    response = model.generate_content(prompt)
+    return response.text
 
 
 @app.route('/generate_contract', methods=['POST'])
@@ -298,8 +306,9 @@ def analyze_document():
 **التوصيات:**
 - ...
 """
-    response = ollama.chat(model='kimi-k2.5:cloud', messages=[{'role': 'user', 'content': prompt}])
-    return jsonify({"analysis": response['message']['content']})
+    model = genai.GenerativeModel('gemini-1.5-flash')
+    response = model.generate_content(prompt)
+    return jsonify({"analysis": response.text})
 
 
 # ========== حاسبة المواعيد القانونية ==========
@@ -334,7 +343,6 @@ def calculate_deadlines():
     })
 
 
-# ========== مسارات API ==========
 @app.route('/')
 def serve_index():
     return send_from_directory('.', 'index.html')
@@ -349,21 +357,12 @@ def ask():
     return jsonify(ask_lawyer(query))
 
 
-@app.route('/api/ask', methods=['POST'])
-def api_ask():
-    data = request.get_json()
-    query = data.get('query', '')
-    if not query:
-        return jsonify({"error": "الرجاء إدخال سؤال"}), 400
-    return jsonify(ask_lawyer(query))
-
-
 @app.route('/upload', methods=['POST'])
 def upload():
     if 'file' not in request.files:
         return jsonify({"error": "لا يوجد ملف"}), 400
     file = request.files['file']
-    file_extension = os.path.splitext(file.filename).filename.lower()  # تم تصحيحها لاسم الملف
+    file_extension = os.path.splitext(file.filename)[1].lower()
     with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as tmp:
         file.save(tmp.name)
         result = add_file_to_library(tmp.name, file.filename)
