@@ -16,19 +16,19 @@ from flask_cors import CORS
 from dotenv import load_dotenv
 import easyocr
 import fitz  # PyMuPDF
-import anthropic  # ✅ Claude API بدلاً من Gemini
+import google.generativeai as genai
 
 app = Flask(__name__)
 CORS(app)
 load_dotenv()
 
-# ========== تهيئة Claude API ==========
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-if ANTHROPIC_API_KEY:
-    claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+# ========== تهيئة Gemini API ==========
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    print("✅ Gemini API جاهز")
 else:
-    print("⚠️ تحذير: ANTHROPIC_API_KEY غير موجود في ملف .env")
-    claude_client = None
+    print("⚠️ تحذير: GEMINI_API_KEY غير موجود في ملف .env")
 
 # ========== تحميل النماذج ==========
 print("⏳ جاري تحميل نموذج التضمين (Embedding)...")
@@ -67,15 +67,12 @@ def save_history(history):
 
 # ========== دوال تنظيف النص العربي ==========
 def clean_arabic_text(text):
-    """
-    ✅ إصلاح: get_display() يعكس النص للعرض المرئي فقط
-    لا نستخدمها عند التخزين في ChromaDB حتى لا يتأثر البحث
-    """
+    # ✅ إصلاح: بدون get_display() عند الحفظ في ChromaDB
     if not text:
         return ""
     try:
         reshaped = arabic_reshaper.reshape(text)
-        return reshaped  # ✅ بدون get_display() عند الحفظ
+        return reshaped
     except Exception as e:
         print(f"⚠️ خطأ في تنظيف النص: {e}")
         return text
@@ -90,7 +87,8 @@ def extract_text_with_fallback(file_path, file_extension=None):
     full_text = ""
     method_used = None
 
-    ext = file_extension or os.path.splitext(file_path)[1].lower()  # ✅ إصلاح os.path.path
+    # ✅ إصلاح: os.path.splitext بدون os.path.path
+    ext = file_extension or os.path.splitext(file_path)[1].lower()
 
     if ext == '.pdf':
         try:
@@ -191,27 +189,28 @@ def initial_scan_and_build():
                         print(add_file_to_library(os.path.join(root, file)))
 
 
-# ========== دالة مساعدة لاستدعاء Claude ==========
-def call_claude(prompt, max_tokens=1500):
-    """دالة مركزية لاستدعاء Claude API"""
-    if not claude_client:
-        return "❌ خطأ: ANTHROPIC_API_KEY غير موجود في ملف .env"
+# ========== دالة مساعدة لاستدعاء Gemini ==========
+def call_gemini(prompt):
+    if not GEMINI_API_KEY:
+        return "❌ خطأ: GEMINI_API_KEY غير موجود في ملف .env"
     try:
-        response = claude_client.messages.create(
-            model="claude-haiku-4-5-20251001",  # الأرخص والأسرع
-            max_tokens=max_tokens,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        return response.content[0].text
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        response = model.generate_content(prompt)
+        return response.text
     except Exception as e:
-        print(f"❌ خطأ في Claude API: {e}")
-        return f"حدث خطأ أثناء معالجة الطلب: {str(e)}"
+        error_msg = str(e)
+        print(f"❌ خطأ Gemini: {error_msg}")
+        if "429" in error_msg or "quota" in error_msg.lower():
+            return "⚠️ تجاوزت الحد اليومي المجاني. حاول غداً أو أنشئ مفتاح جديد من: https://aistudio.google.com/apikey"
+        if "400" in error_msg or "API_KEY" in error_msg:
+            return "❌ مفتاح Gemini غير صالح. تحقق من ملف .env"
+        return f"❌ خطأ: {error_msg}"
 
 
-# ========== دالة الإجابة باستخدام Claude ==========
+# ========== دالة الإجابة ==========
 def ask_lawyer(query):
     try:
-        # ✅ إصلاح: encode مفرد ثم wrap في list عند الإرسال لـ ChromaDB
+        # ✅ إصلاح: query_embeddings يجب أن يكون list من list
         query_embedding = model_embedding.encode("query: " + query).tolist()
         results = collection.query(query_embeddings=[query_embedding], n_results=3)
 
@@ -221,11 +220,11 @@ def ask_lawyer(query):
 مهمتك: تقديم إجابات قانونية دقيقة ومنظمة بناءً فقط على النصوص القانونية المرفقة.
 
 قواعد التنسيق الإلزامية:
-- استخدم عناوين رئيسية على شكل: 1-العنوان (استخدم الأرقام)
-- استخدم عناوين فرعية على شكل: أ-العنوان (استخدم الحرف)
+- استخدم عناوين رئيسية على شكل: 1-العنوان
+- استخدم عناوين فرعية على شكل: أ-العنوان
 - افصل بين كل عنوان وعنوان بسطر فارغ.
-- لا تنسخ النص حرفياً من المصادر، بل أعد صياغته بلغة قانونية واضحة ومختصرة.
-- لا تذكر عبارات مثل "بناءً على النصوص أعلاه". ابدأ الإجابة مباشرة.
+- لا تنسخ النص حرفياً، بل أعد صياغته بلغة قانونية واضحة.
+- ابدأ الإجابة مباشرة بدون مقدمات.
 
 النصوص القانونية:
 {context}
@@ -235,7 +234,7 @@ def ask_lawyer(query):
 
 الإجابة (باللغة العربية):"""
 
-        answer = call_claude(full_prompt, max_tokens=1500)
+        answer = call_gemini(full_prompt)
         return {"answer": answer}
 
     except Exception as e:
@@ -246,27 +245,17 @@ def ask_lawyer(query):
 # ========== مولد العقود ==========
 def generate_contract(contract_type, parties, subject, duration, amount):
     prompt = f"""أنت مستشار قانوني جزائري متخصص في صياغة العقود.
-بناءً على النصوص القانونية الجزائرية (قانون التجارة، قانون الصفقات العمومية، القانون المدني)، قم بإنشاء عقد كامل من نوع "{contract_type}" يتضمن المواد التالية على الأقل:
-- تعريف الأطراف
-- موضوع العقد
-- المدة: {duration}
-- المبلغ: {amount}
-- التزامات الطرفين
-- شروط الدفع
-- الجزاءات والغرامات التأخيرية
-- الضمانات
-- تسوية النزاعات (التحكيم أو المحاكم الجزائرية)
-- أحكام عامة (القوة القاهرة، اللغة، عدد النسخ)
+بناءً على القانون الجزائري (قانون التجارة، القانون المدني)، أنشئ عقداً كاملاً من نوع "{contract_type}" يتضمن:
+- تعريف الأطراف | موضوع العقد | المدة: {duration} | المبلغ: {amount}
+- التزامات الطرفين | شروط الدفع | الجزاءات | الضمانات
+- تسوية النزاعات | أحكام عامة (القوة القاهرة، اللغة، عدد النسخ)
 
-أطراف العقد:
-{parties}
+أطراف العقد: {parties}
+موضوع العقد: {subject}
 
-موضوع العقد:
-{subject}
-
-اكتب العقد بلغة قانونية واضحة، مرقماً المواد (مادة 1، مادة 2...)، منسقاً بأسطر فارغة بين المواد. ابدأ مباشرة بنص العقد.
+ابدأ مباشرة بنص العقد مرقم المواد (مادة 1، مادة 2...).
 """
-    return call_claude(prompt, max_tokens=2000)
+    return call_gemini(prompt)
 
 
 @app.route('/generate_contract', methods=['POST'])
@@ -295,11 +284,8 @@ def download_contract_pdf():
         subprocess.check_call([sys.executable, "-m", "pip", "install", "fpdf2"])
         from fpdf import FPDF
 
-    # ✅ إصلاح: دعم العربية في PDF
     pdf = FPDF()
     pdf.add_page()
-
-    # محاولة إضافة خط عربي إذا كان موجوداً
     arabic_font_path = "fonts/NotoNaskhArabic-Regular.ttf"
     if os.path.exists(arabic_font_path):
         pdf.add_font("Arabic", "", arabic_font_path, uni=True)
@@ -309,7 +295,6 @@ def download_contract_pdf():
 
     for line in contract_text.split('\n'):
         try:
-            # إعادة تشكيل النص العربي للعرض الصحيح في PDF
             reshaped = arabic_reshaper.reshape(line)
             bidi_line = get_display(reshaped)
             pdf.multi_cell(0, 10, bidi_line)
@@ -335,15 +320,14 @@ def analyze_document():
     if not text:
         return jsonify({"error": "تعذر استخراج النص من الملف"}), 400
 
-    prompt = f"""أنت خبير قانوني جزائري. قم بتحليل النص التالي وأخرج:
+    prompt = f"""أنت خبير قانوني جزائري. حلل النص التالي وأخرج:
 1. ملخص (3-5 جمل)
-2. نقاط الخطر القانونية (Clauses à risque) - إن وجدت، وإلا اذكر "لا توجد نقاط خطر واضحة"
-3. توصيات عملية للمستخدم
+2. نقاط الخطر القانونية - إن وجدت، وإلا: "لا توجد نقاط خطر واضحة"
+3. توصيات عملية
 
 النص:
 {text[:4000]}
 
-أجب بالتنسيق التالي:
 **الملخص:**
 ...
 **نقاط الخطر:**
@@ -351,7 +335,7 @@ def analyze_document():
 **التوصيات:**
 - ...
 """
-    analysis = call_claude(prompt, max_tokens=1500)
+    analysis = call_gemini(prompt)
     return jsonify({"analysis": analysis})
 
 
