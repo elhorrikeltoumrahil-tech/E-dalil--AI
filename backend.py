@@ -23,7 +23,6 @@ import requests
 from flask import Flask, request, jsonify, send_from_directory, send_file
 from flask_cors import CORS
 from dotenv import load_dotenv
-from openai import OpenAI      # استخدم OpenAI client للاتصال بـ NVIDIA
 import easyocr
 import fitz
 
@@ -32,22 +31,15 @@ app = Flask(__name__)
 CORS(app)
 load_dotenv()  # تحميل المتغيرات من .env
 
-# ---------------------- إعدادات NVIDIA API ----------------------
-# استخدام المفتاح من متغير البيئة NVIDIA_API_KEY
-NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
-if not NVIDIA_API_KEY:
-    print("⚠️ تحذير: لم يتم العثور على NVIDIA_API_KEY في ملف .env")
+import google.generativeai as genai
+print("المفتاح المقروء:", os.getenv("GEMINI_API_KEY"))
+# ---------------------- إعدادات Gemini API ----------------------
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if not GEMINI_API_KEY:
+    print("⚠️ تحذير: لم يتم العثور على GEMINI_API_KEY في ملف .env")
     print("⚠️ سيتم استخدام وضع المحاكاة (mock) للإجابات.")
 
-# تهيئة عميل OpenAI مع عنوان NVIDIA
-client = OpenAI(
-    base_url="https://integrate.api.nvidia.com/v1",
-    api_key=NVIDIA_API_KEY if NVIDIA_API_KEY else "dummy-key"
-)
-
-# اسم النموذج المعتمد من NVIDIA (DeepSeek-V4-Pro)
-NVIDIA_MODEL = "deepseek-ai/deepseek-v4-pro"
-
+genai.configure(api_key=GEMINI_API_KEY if GEMINI_API_KEY else "dummy-key")
 # ---------------------- تحميل نماذج الذكاء الاصطناعي المحلية ----------------------
 print("⏳ جاري تحميل نموذج التضمين (Embedding)...")
 model_embedding = SentenceTransformer('intfloat/multilingual-e5-small')
@@ -194,62 +186,47 @@ def initial_scan_and_build():
                         print(add_file_to_library(os.path.join(root, file)))
 
 # ---------------------- دالة استدعاء NVIDIA API (بديل DeepSeek) ----------------------
-def deepseek_chat(prompt: str, system_message: str = "أنت مستشار قانوني جزائري محترف.") -> str:
+# ---------------------- دالة استدعاء Gemini API ----------------------
+def gemini_chat(prompt: str, system_message: str = "أنت مستشار قانوني جزائري محترف.") -> str:
     """
-    إرسال طلب إلى NVIDIA API (DeepSeek-V4-Pro) باستخدام عميل OpenAI.
-    تعيد النص الناتج، أو رسالة خطأ في حالة الفشل.
+    إرسال طلب إلى Gemini 1.5 Flash.
     """
-    if not NVIDIA_API_KEY:
-        return "⚠️ لم يتم تكوين مفتاح NVIDIA API. يرجى إضافة NVIDIA_API_KEY في ملف .env."
+    if not GEMINI_API_KEY:
+        return "⚠️ لم يتم تكوين مفتاح GEMINI API. يرجى إضافة GEMINI_API_KEY في ملف .env."
 
     try:
-        # استدعاء النموذج مع دعم رسالة النظام
-        completion = client.chat.completions.create(
-            model=NVIDIA_MODEL,
-            messages=[
-                {"role": "system", "content": system_message},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.3,       # دقة عالية للإجابات القانونية
-            top_p=0.95,
-            max_tokens=2000,
-            stream=False           # نفضل الحصول على الرد كاملاً
+        # إعداد النموذج مع رسالة النظام (System Instruction)
+        model = genai.GenerativeModel(
+            model_name='gemini-1.5-flash',
+            system_instruction=system_message
         )
-        return completion.choices[0].message.content
+
+        # استدعاء الذكاء الاصطناعي
+        response = model.generate_content(
+            prompt,
+            generation_config=genai.types.GenerationConfig(
+                temperature=0.3,  # دقة عالية للقانون
+            )
+        )
+        return response.text
     except Exception as e:
-        print(f"❌ خطأ في طلب NVIDIA API: {e}")
-        return f"حدث خطأ أثناء الاتصال بخدمة NVIDIA: {str(e)}"
+        print(f"❌ خطأ في طلب Gemini API: {e}")
+        return f"حدث خطأ أثناء الاتصال بخدمة Gemini: {str(e)}"
 
 # ---------------------- الإجابة على الأسئلة باستخدام RAG ----------------------
 # 1. استبدل دالة ask_lawyer ودالة التضمين بهذا الكود المحسن
-def get_embedding_api(text):
-    """جلب التضمين (Embedding) من NVIDIA API بدلاً من تشغيله محلياً"""
-    try:
-        response = client.embeddings.create(
-            input=[text],
-            model="nvidia/nv-embedqa-e5-v5"  # نموذج تضمين خفيف وسريع من NVIDIA
-        )
-        return response.data[0].embedding
-    except Exception as e:
-        print(f"Error in embedding: {e}")
-        return None
-
 
 # 2. تحديث دالة البحث لتستخدم الـ API
 def ask_lawyer(query):
     try:
-        # استخدام الـ API للتضمين بدلاً من النموذج المحلي model_embedding
-        query_embedding = get_embedding_api("query: " + query)
-        if not query_embedding:
-            return {"answer": "خطأ في جلب التضمين من السحاب."}
+        query_embedding = model_embedding.encode([query]).tolist()
+        results = collection.query(query_embeddings=query_embedding, n_results=3)
 
-        results = collection.query(query_embeddings=[query_embedding], n_results=3)
-        context = "\n".join(results['documents'][0]) if results['documents'] else "لا يوجد سياق."
-
+        context = "\n".join(results['documents'][0]) if results['documents'] else "لا يوجد سياق قانوني متاح."
         full_prompt = f"بناءً على النصوص: {context}\nالسؤال: {query}"
 
-        # استدعاء الشات (تأكد من ضبط stream=True في دالة deepseek_chat إذا أردت السرعة)
-        answer = deepseek_chat(full_prompt)
+        # استدعاء الشات (تأكد من ضبط stream=True في دالة gemini_chat إذا أردت السرعة)
+        answer = gemini_chat(full_prompt)
         return {"answer": answer}
     except Exception as e:
         return {"answer": f"حدث خطأ: {str(e)}"}
@@ -299,7 +276,7 @@ def generate_contract(contract_type, parties, subject, duration, amount):
 
 اكتب العقد بلغة قانونية واضحة، مرقماً المواد (مادة 1، مادة 2، ...)، مع ترك سطر فارغ بين المواد. لا تذكر أي جمل تمهيدية، ابدأ مباشرة بنص العقد."""
     system_msg = "أنت مستشار قانوني جزائري متخصص في صياغة العقود. استخدم اللغة العربية الفصحى واتبع أحكام القانون الجزائري."
-    return deepseek_chat(prompt, system_message=system_msg)
+    return gemini_chat(prompt, system_message=system_msg)
 
 # ---------------------- مسارات API ----------------------
 
@@ -316,25 +293,6 @@ def api_generate_contract():
     contract_text = generate_contract(contract_type, parties, subject, duration, amount)
     return jsonify({"contract": contract_text})
 
-@app.route('/download_contract_pdf', methods=['POST'])
-def download_contract_pdf():
-    data = request.get_json()
-    contract_text = data.get('contract')
-    if not contract_text:
-        return jsonify({"error": "لا يوجد نص عقد"}), 400
-    try:
-        from fpdf import FPDF
-    except ImportError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "fpdf2"])
-        from fpdf import FPDF
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_font('Helvetica', size=12)
-    for line in contract_text.split('\n'):
-        pdf.multi_cell(0, 10, line)
-    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
-    pdf.output(temp_file.name)
-    return send_file(temp_file.name, as_attachment=True, download_name='contrat_genere.pdf')
 
 @app.route('/analyze_document', methods=['POST'])
 def analyze_document():
@@ -366,7 +324,7 @@ def analyze_document():
 - ...
 """
     system_msg = "أنت خبير قانوني جزائري في تحليل العقود والوثائق القانونية."
-    analysis = deepseek_chat(prompt, system_message=system_msg)
+    analysis = gemini_chat(prompt, system_message=system_msg)
     return jsonify({"analysis": analysis})
 
 # ---------------------- حاسبة المواعيد القانونية ----------------------
