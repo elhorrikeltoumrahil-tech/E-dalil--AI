@@ -16,18 +16,19 @@ from flask_cors import CORS
 from dotenv import load_dotenv
 import easyocr
 import fitz  # PyMuPDF
-import google.generativeai as genai
+import anthropic  # ✅ Claude API بدلاً من Gemini
 
 app = Flask(__name__)
 CORS(app)
 load_dotenv()
 
-# ========== تهيئة Gemini API ==========
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+# ========== تهيئة Claude API ==========
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+if ANTHROPIC_API_KEY:
+    claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 else:
-    print("⚠️ تحذير: GEMINI_API_KEY غير موجود في ملف .env")
+    print("⚠️ تحذير: ANTHROPIC_API_KEY غير موجود في ملف .env")
+    claude_client = None
 
 # ========== تحميل النماذج ==========
 print("⏳ جاري تحميل نموذج التضمين (Embedding)...")
@@ -66,12 +67,15 @@ def save_history(history):
 
 # ========== دوال تنظيف النص العربي ==========
 def clean_arabic_text(text):
+    """
+    ✅ إصلاح: get_display() يعكس النص للعرض المرئي فقط
+    لا نستخدمها عند التخزين في ChromaDB حتى لا يتأثر البحث
+    """
     if not text:
         return ""
     try:
         reshaped = arabic_reshaper.reshape(text)
-        bidi_text = get_display(reshaped)
-        return bidi_text
+        return reshaped  # ✅ بدون get_display() عند الحفظ
     except Exception as e:
         print(f"⚠️ خطأ في تنظيف النص: {e}")
         return text
@@ -86,7 +90,9 @@ def extract_text_with_fallback(file_path, file_extension=None):
     full_text = ""
     method_used = None
 
-    if file_extension == '.pdf' or (file_extension is None and file_path.lower().endswith('.pdf')):
+    ext = file_extension or os.path.splitext(file_path)[1].lower()  # ✅ إصلاح os.path.path
+
+    if ext == '.pdf':
         try:
             with pdfplumber.open(file_path) as pdf:
                 for page in pdf.pages:
@@ -117,7 +123,7 @@ def extract_text_with_fallback(file_path, file_extension=None):
             except Exception as e:
                 print(f"⚠️ فشل EasyOCR: {e}")
 
-    elif file_extension in ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']:
+    elif ext in ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']:
         if easyocr_reader:
             result = easyocr_reader.readtext(file_path, detail=0, paragraph=True)
             if result:
@@ -149,7 +155,8 @@ def add_file_to_library(file_path, original_filename=None):
     if display_name in history:
         return f"⚠️ الملف '{display_name}' تمت إضافته مسبقاً."
 
-    full_text, method = extract_text_with_fallback(file_path, os.path.path.splitext(file_path)[1].lower())
+    ext = os.path.splitext(file_path)[1].lower()  # ✅ إصلاح
+    full_text, method = extract_text_with_fallback(file_path, ext)
     if not full_text:
         return "❌ تعذر استخراج النص."
 
@@ -169,8 +176,13 @@ def add_file_to_library(file_path, original_filename=None):
 def initial_scan_and_build():
     if collection.count() > 0:
         return
-    folders = ["data/01--- قوانين وزارة التجارة", "data/التجارة الالكترونية", "data/قوانين السجل التجاري",
-               "data/contrats_exemples", "data/كتب تجارية"]
+    folders = [
+        "data/01--- قوانين وزارة التجارة",
+        "data/التجارة الالكترونية",
+        "data/قوانين السجل التجاري",
+        "data/contrats_exemples",
+        "data/كتب تجارية"
+    ]
     for folder in folders:
         if os.path.exists(folder):
             for root, _, files in os.walk(folder):
@@ -179,11 +191,29 @@ def initial_scan_and_build():
                         print(add_file_to_library(os.path.join(root, file)))
 
 
-# ========== دالة الإجابة باستخدام Gemini 1.5 Flash ==========
+# ========== دالة مساعدة لاستدعاء Claude ==========
+def call_claude(prompt, max_tokens=1500):
+    """دالة مركزية لاستدعاء Claude API"""
+    if not claude_client:
+        return "❌ خطأ: ANTHROPIC_API_KEY غير موجود في ملف .env"
+    try:
+        response = claude_client.messages.create(
+            model="claude-haiku-4-5-20251001",  # الأرخص والأسرع
+            max_tokens=max_tokens,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.content[0].text
+    except Exception as e:
+        print(f"❌ خطأ في Claude API: {e}")
+        return f"حدث خطأ أثناء معالجة الطلب: {str(e)}"
+
+
+# ========== دالة الإجابة باستخدام Claude ==========
 def ask_lawyer(query):
     try:
-        query_embedding = model_embedding.encode([query]).tolist()
-        results = collection.query(query_embeddings=query_embedding, n_results=3)
+        # ✅ إصلاح: encode مفرد ثم wrap في list عند الإرسال لـ ChromaDB
+        query_embedding = model_embedding.encode("query: " + query).tolist()
+        results = collection.query(query_embeddings=[query_embedding], n_results=3)
 
         context = "\n".join(results['documents'][0]) if results['documents'] else "لا يوجد سياق قانوني متاح."
 
@@ -192,11 +222,10 @@ def ask_lawyer(query):
 
 قواعد التنسيق الإلزامية:
 - استخدم عناوين رئيسية على شكل: 1-العنوان (استخدم الأرقام)
-- استخدم عناوين فرعية على شكل: أ-العنوان(استخدم الحرف)
-- افصل بين كل عنوان و عنوان بسطر فارغ.
-- استعمل خط كبير للعنوانين و خط رقيق للاجابة 
+- استخدم عناوين فرعية على شكل: أ-العنوان (استخدم الحرف)
+- افصل بين كل عنوان وعنوان بسطر فارغ.
 - لا تنسخ النص حرفياً من المصادر، بل أعد صياغته بلغة قانونية واضحة ومختصرة.
-- لا تذكر عبارات مثل "بناءً على النصوص أعلاه" أو "وفقاً للمصادر". ابدأ الإجابة مباشرة.
+- لا تذكر عبارات مثل "بناءً على النصوص أعلاه". ابدأ الإجابة مباشرة.
 
 النصوص القانونية:
 {context}
@@ -206,12 +235,12 @@ def ask_lawyer(query):
 
 الإجابة (باللغة العربية):"""
 
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        response = model.generate_content(full_prompt)
-        return {"answer": response.text}
+        answer = call_claude(full_prompt, max_tokens=1500)
+        return {"answer": answer}
+
     except Exception as e:
-        print(f"❌ خطأ في طلب Gemini API: {e}")
-        return {"answer": "حدث خطأ أثناء معالجة السؤال. يرجى التحقق من مفتاح API Key."}
+        print(f"❌ خطأ في ask_lawyer: {e}")
+        return {"answer": "حدث خطأ أثناء معالجة السؤال."}
 
 
 # ========== مولد العقود ==========
@@ -235,11 +264,9 @@ def generate_contract(contract_type, parties, subject, duration, amount):
 موضوع العقد:
 {subject}
 
-اكتب العقد بلغة قانونية واضحة، مرقماً المواد (مادة 1، مادة 2...), منسقاً بأسطر فارغة بين المواد. لا تذكر أي جمل تمهيدية مثل "بناءً على طلبك". ابدأ مباشرة بنص العقد.
+اكتب العقد بلغة قانونية واضحة، مرقماً المواد (مادة 1، مادة 2...)، منسقاً بأسطر فارغة بين المواد. ابدأ مباشرة بنص العقد.
 """
-    model = genai.GenerativeModel('gemini-1.5-flash')
-    response = model.generate_content(prompt)
-    return response.text
+    return call_claude(prompt, max_tokens=2000)
 
 
 @app.route('/generate_contract', methods=['POST'])
@@ -248,8 +275,8 @@ def api_generate_contract():
     contract_type = data.get('type')
     parties = data.get('parties')
     subject = data.get('subject')
-    duration = data.get('duration')
-    amount = data.get('amount')
+    duration = data.get('duration', 'غير محدد')
+    amount = data.get('amount', 'غير محدد')
     if not all([contract_type, parties, subject]):
         return jsonify({"error": "يرجى ملء الحقول المطلوبة"}), 400
     contract_text = generate_contract(contract_type, parties, subject, duration, amount)
@@ -267,11 +294,28 @@ def download_contract_pdf():
     except ImportError:
         subprocess.check_call([sys.executable, "-m", "pip", "install", "fpdf2"])
         from fpdf import FPDF
+
+    # ✅ إصلاح: دعم العربية في PDF
     pdf = FPDF()
     pdf.add_page()
-    pdf.set_font('Helvetica', size=12)
+
+    # محاولة إضافة خط عربي إذا كان موجوداً
+    arabic_font_path = "fonts/NotoNaskhArabic-Regular.ttf"
+    if os.path.exists(arabic_font_path):
+        pdf.add_font("Arabic", "", arabic_font_path, uni=True)
+        pdf.set_font("Arabic", size=12)
+    else:
+        pdf.set_font("Helvetica", size=12)
+
     for line in contract_text.split('\n'):
-        pdf.multi_cell(0, 10, line)
+        try:
+            # إعادة تشكيل النص العربي للعرض الصحيح في PDF
+            reshaped = arabic_reshaper.reshape(line)
+            bidi_line = get_display(reshaped)
+            pdf.multi_cell(0, 10, bidi_line)
+        except Exception:
+            pdf.multi_cell(0, 10, line)
+
     temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
     pdf.output(temp_file.name)
     return send_file(temp_file.name, as_attachment=True, download_name='contrat_genere.pdf')
@@ -290,6 +334,7 @@ def analyze_document():
     os.unlink(tmp.name)
     if not text:
         return jsonify({"error": "تعذر استخراج النص من الملف"}), 400
+
     prompt = f"""أنت خبير قانوني جزائري. قم بتحليل النص التالي وأخرج:
 1. ملخص (3-5 جمل)
 2. نقاط الخطر القانونية (Clauses à risque) - إن وجدت، وإلا اذكر "لا توجد نقاط خطر واضحة"
@@ -306,15 +351,14 @@ def analyze_document():
 **التوصيات:**
 - ...
 """
-    model = genai.GenerativeModel('gemini-1.5-flash')
-    response = model.generate_content(prompt)
-    return jsonify({"analysis": response.text})
+    analysis = call_claude(prompt, max_tokens=1500)
+    return jsonify({"analysis": analysis})
 
 
 # ========== حاسبة المواعيد القانونية ==========
 LEGAL_DEADLINES = {
-    "تقادم دعوى مدنية": 15,
-    "تقادم دعوى تجارية": 10,
+    "تقادم دعوى مدنية": 15 * 365,
+    "تقادم دعوى تجارية": 10 * 365,
     "الطعن في صفقة عمومية (بعد التبليغ)": 60,
     "الطعن في قرار إداري": 30,
     "إنهاء عقد عمل (إشعار مسبق)": 30,
@@ -332,8 +376,7 @@ def calculate_deadlines():
         return jsonify({"error": "نوع الإجراء غير معروف"}), 400
     start_date = datetime.strptime(start_date_str, '%Y-%m-%d')
     days = LEGAL_DEADLINES[action]
-    delta = timedelta(days=days)
-    end_date = start_date + delta
+    end_date = start_date + timedelta(days=days)
     return jsonify({
         "action": action,
         "start_date": start_date_str,
